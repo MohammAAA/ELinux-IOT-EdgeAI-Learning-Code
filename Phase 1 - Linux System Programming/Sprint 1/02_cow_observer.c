@@ -54,7 +54,7 @@ int main(void)
         _exit(0);
     }
 
-    waitpid(pid, NULL, 0);
+    waitpid(pid, NULL, 0); //block the parent process to allow the child process to run.
     fclose(f);
     free(data);
     return 0;

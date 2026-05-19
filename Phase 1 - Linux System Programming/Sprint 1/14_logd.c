@@ -26,6 +26,31 @@
                                     $ for i in $(seq 1 100); do echo "Load test message $i" > /tmp/logd.fifo; done)
                                     )
         Terminal 3: Watch the log file ($ tail -f /var/log/logd.log)
+
+
+    Test Result: FAIL
+    Test steps: press ctrl + c in Terminal 1
+    Test expectation: Clean shutdown with no crashes, no resource leaks.
+    Actual result: Software stucks in infinite loop and never shutdowns.
+    Issue analysis (Timeline):
+        T1  We send messages with echo → writer opens FIFO, writes, closes
+        T2  Reader gets POLLHUP → closes fd → calls open(FIFO_PATH, O_RDONLY) to reopen
+        T3  open() BLOCKS — no writer connected yet (this is the normal FIFO behavior)
+        T4  We press Ctrl+C
+        T5  Kernel delivers SIGINT to the MAIN thread (it's in sleep(1))
+        T6  Main: signal_handler sets g_running = 0
+        T7  Main: rb_request_shutdown() → workers see shutdown, exit ✓
+        T8  Main: pthread_join(reader, NULL) → BLOCKS FOREVER
+            │
+            └── Reader is stuck in open() — it never received the signal!
+                open() only unblocks when a writer connects OR the thread
+                that's blocked receives the signal directly.
+
+    Root cause:
+        POSIX delivers signals to any thread that hasn't blocked it. The main thread happened to receive SIGINT (it was in sleep(1)). The reader thread was in open() — but signals delivered to a different thread do NOT interrupt another thread's blocking syscall.
+        So open(FIFO_PATH, O_RDONLY) just... sits there. Forever. Waiting for a writer that will never come.
+
+
  */
 
 #define _GNU_SOURCE

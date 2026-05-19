@@ -44,8 +44,8 @@
 #include <sys/syscall.h> /* For SYS_gettid */
 
 /* ─── Configuration ─────────────────────────────────────────────── */
-#define FIFO_PATH       "/tmp/logd.fifo"
-#define LOG_PATH        "/var/log/logd.log"
+#define FIFO_PATH       "/tmp/logd.fifo" /* the /tmp/ folder contents are stored in RAM (via the tmpfs)*/
+#define LOG_PATH        "/var/log/logd.log" /* the /var/ folder contents are stored on disk (slow IO), it is used for growing, persistent, and variable files that are actively modified by the system while it is running. This includes system logs, databases, ...*/
 #define RING_BUF_SIZE   4096
 #define NUM_WORKERS     3
 #define POLL_TIMEOUT_MS 5000     /* 5 seconds — reader checks for shutdown */
@@ -56,7 +56,7 @@ typedef struct {
     char           *messages[RING_BUF_SIZE];
     int             head;           /* dequeue from here */
     int             tail;           /* enqueue here */
-    int             count;          /* current occupancy */
+    int             count;          /* current ring buffer allocation count */
     pthread_mutex_t mutex;
     pthread_cond_t  not_empty;      /* consumers wait on this */
     pthread_cond_t  not_full;       /* producers wait on this */
@@ -101,7 +101,7 @@ static int rb_init(ring_buffer_t *rb) {
     if (ret != 0) {
         errno = ret;
         perror("pthread_cond_init not_full");
-        pthread_cond_destroy(&rb->mutex);
+        pthread_mutex_destroy(&rb->mutex);
         pthread_cond_destroy(&rb->not_empty);
         return -1;
     }
@@ -112,12 +112,12 @@ static int rb_init(ring_buffer_t *rb) {
  * rb_destroy — free all remaining messages and destroy sync primitives
  *
  * IMPORTANT: Only call after all producer/consumer threads have stopped.
- *           Otherwise you'll destroy a mutex that a thread is blocked on → UB.
+ *           Otherwise we'll destroy a mutex that a thread is blocked on.
  */
 static void rb_destroy(ring_buffer_t *rb) {
     /* Free any messages still in the buffer (e.g., during shutdown) */
     for (int i = 0; i < rb->count; i++) {
-        int idx = (rb->head + i) % RING_BUF_SIZE;
+        int idx = (rb->head + i) % RING_BUF_SIZE; /* We need to mod RING_BUF_SIZE to handle the cases when the buffer wraps on itself*/
         free(rb->messages[idx]);
     }
     pthread_mutex_destroy(&rb->mutex);
@@ -199,7 +199,7 @@ static char *rb_pop(ring_buffer_t *rb) {
     rb->head = (rb->head + 1) % RING_BUF_SIZE;
     rb->count--;
 
-    /* Signal ONE waiting producer — we freed one slot */
+    /* Signal ONE waiting producer — we freed only one slot */
     pthread_cond_signal(&rb->not_full);
 
     pthread_mutex_unlock(&rb->mutex);
@@ -256,7 +256,7 @@ static void signal_handler(int sig) {
  *
  * We DON'T mask signals here in the main thread because the reader thread
  * calls poll() with a timeout — it will notice g_running == 0 within
- * POLL_TIMEOUT_MS. Saturday's lesson will cover proper per-thread masking.
+ * POLL_TIMEOUT_MS. Tomorrow's lesson will cover proper per-thread masking.
  */
 static void setup_signals(void) {
     struct sigaction sa;
@@ -314,7 +314,7 @@ static const char *get_timestamp(void) {
 /* ─── Worker Thread ─────────────────────────────────────────────── */
 
 /*
- * Worker argument — passed via heap allocation (Rule #1 from Wednesday!)
+ * Worker argument — passed via heap allocation
  */
 typedef struct {
     int    id;      /* Worker number: 0, 1, 2, ... */
@@ -336,8 +336,8 @@ static void *worker_thread(void *arg) {
     int fd = warg->log_fd;
     free(warg);  /* We own this memory — free immediately after copying fields */
 
-    printf("[logd] Worker %d started (tid=%lu)\n", id,
-           (unsigned long)pthread_self());
+    printf("[logd] Worker %d started (tid=%ld)\n", id,
+           syscall(SYS_gettid));
 
     char *msg;
     while ((msg = rb_pop(&g_ring)) != NULL) {
@@ -347,7 +347,7 @@ static void *worker_thread(void *arg) {
          * WARNING: get_timestamp() uses a static buffer.
          * If two workers call this simultaneously, they'll race on the buffer.
          * For now this is acceptable — the worst case is a slightly garbled
-         * timestamp. Saturday's exercise: fix with snprintf into a local buffer.
+         * timestamp. Next exercise: fix with snprintf into a local buffer.
          */
         const char *ts = get_timestamp();
 
@@ -372,7 +372,10 @@ static void *worker_thread(void *arg) {
             ssize_t n = write(fd, linebuf + total_written,
                               linelen - total_written);
             if (n < 0) {
-                if (errno == EINTR) continue;  /* Interrupted by signal — retry */
+                if (errno == EINTR)
+                {
+                    continue;  /* Interrupted by signal — retry */
+                }
                 perror("write to log file");
                 break;
             }
@@ -490,7 +493,7 @@ static void *reader_thread(void *arg) {
         /*
          * POLLHUP: writer disconnected.
          *
-         * CRITICAL EDGE CASE (from Tuesday!):
+         * CRITICAL EDGE CASE (from Tuesday lesson!):
          * POLLHUP can arrive WITH POLLIN.
          * If there's still data in the pipe buffer, we must drain it first.
          *

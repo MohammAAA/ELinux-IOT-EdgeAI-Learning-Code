@@ -50,6 +50,16 @@
         POSIX delivers signals to any thread that hasn't blocked it. The main thread happened to receive SIGINT (it was in sleep(1)). The reader thread was in open() — but signals delivered to a different thread do NOT interrupt another thread's blocking syscall.
         So open(FIFO_PATH, O_RDONLY) just... sits there. Forever. Waiting for a writer that will never come.
 
+    The Fix (2 steps to be done):
+        1- Open FIFO with O_RDWR instead of O_RDONLY (eliminates the block)
+            Why this works: When we open a FIFO with O_RDWR, your process acts as both reader and writer. The kernel sees at least one writer connected (This thread!), so open() returns immediately. We can still only read() from it; we just never actually write.
+            Tradeoff: We lose POLLHUP detection for individual writer disconnections, because our own O_RDWR reference keeps the FIFO "alive." For a logger daemon, this is perfectly acceptable; writers come and go, and we don't need to know when they disconnect.
+        2- Shutdown pipe (immediate, reliable notification):
+            Even with O_RDWR, there's still a 5-second delay (the poll() timeout) before the reader notices g_running == 0.
+            For instant shutdown, we use the self-pipe trick; the classic Unix pattern:
+                - Main thread signals shutdown by writing to a pipe.
+                - Reader thread includes that pipe in its poll() set.
+                - poll() returns immediately, reader exits.
 
  */
 
@@ -249,9 +259,10 @@ static void rb_request_shutdown(ring_buffer_t *rb) {
 
 /* ─── Global State ──────────────────────────────────────────────── */
 
-static ring_buffer_t g_ring;       /* shared ring buffer */
-static int           g_log_fd = -1;/* log file descriptor */
+static ring_buffer_t         g_ring;       /* shared ring buffer */
+static int                   g_log_fd = -1;/* log file descriptor */
 static volatile sig_atomic_t g_running = 1;  /* set to 0 by signal handler */
+static int                   g_shutdown_pipe[2] = { -1, -1 };  /* The self (shutdown) pipe*/
 
 /* ─── Signal Handling ───────────────────────────────────────────── */
 
@@ -425,49 +436,47 @@ static void *worker_thread(void *arg) {
  * We won't get partial messages from a single writer.
  */
 static void *reader_thread(void *arg) {
-    (void)arg;  /* No data needed */
+    (void)arg; /* No data needed */
     int fd = -1;
     char buf[4096];
-    struct pollfd pfd;
+    struct pollfd pfds[2];
+    int nfds = 1;  /* Number of fds to poll */
 
     printf("[logd] Reader thread started, opening FIFO...\n");
 
-    /*
-     * Open the FIFO — BLOCKS until a writer connects.
-     *
-     * This is the first thing the reader does. The daemon appears to
-     * "hang" here until someone opens the FIFO for writing.
-     * That's correct behavior — the daemon is ready and waiting.
-     */
-    fd = open(FIFO_PATH, O_RDONLY);
+    /* Open FIFO with O_RDWR — never blocks */
+    fd = open(FIFO_PATH, O_RDWR);
     if (fd < 0) {
         perror("open FIFO");
-        g_running = 0;  /* Signal shutdown to main thread */
+        g_running = 0; /* Signal shutdown to main thread */
         return NULL;
     }
 
     printf("[logd] FIFO opened, reading messages...\n");
 
     while (g_running) {
-        pfd.fd = fd;
-        pfd.events = POLLIN;     /* We want to know when data is available */
-        pfd.revents = 0;
+        /* Set up poll: [0] = FIFO, [1] = shutdown pipe */
+        memset(pfds, 0, sizeof(pfds));
 
-        /*
-         * poll() with timeout — why not block forever?
-         *
-         * If we block forever in poll(), we'd never notice g_running == 0
-         * (set by the signal handler) until new data arrives.
-         * The timeout ensures we check periodically.
-         *
-         * POLL_TIMEOUT_MS = 5000 (5 seconds) is a good balance:
-         *   - Short enough: daemon responds to SIGTERM within 5s
-         *   - Long enough: minimal unnecessary wakeups (zero CPU while sleeping)
-         */
-        int ret = poll(&pfd, 1, POLL_TIMEOUT_MS);
+        pfds[0].fd = fd;
+        pfds[0].events = POLLIN; /* We want to know when data is available */
+
+        /* Include shutdown pipe in poll set.
+         * When main thread writes to g_shutdown_pipe[1],
+         * this becomes readable and poll() returns immediately. */
+        if (g_shutdown_pipe[0] >= 0) {
+            pfds[1].fd = g_shutdown_pipe[0];
+            pfds[1].events = POLLIN;
+            nfds = 2;
+        } else {
+            nfds = 1;
+        }
+
+        int ret = poll(pfds, nfds, POLL_TIMEOUT_MS);
 
         if (ret < 0) {
-            if (errno == EINTR) {
+            if (errno == EINTR)
+            {
                 /* Interrupted by signal — check g_running and loop */
                 continue;
             }
@@ -480,17 +489,26 @@ static void *reader_thread(void *arg) {
             continue;
         }
 
+        /* ── Shutdown pipe readable → time to exit ── */
+        if (nfds == 2 && (pfds[1].revents & POLLIN)) {
+            /* Drain the pipe (read the byte) so it doesn't trigger again */
+            char dummy;
+            read(g_shutdown_pipe[0], &dummy, 1);
+            printf("[logd] Reader received shutdown signal via pipe\n");
+            break;
+        }
+
         /*
          * POLLIN: data available to read
          *
          * Read in a loop until EAGAIN/EWOULDBLOCK (no more data in pipe buffer)
          * This drains ALL available data, not just one message.
          */
-        if (pfd.revents & POLLIN) {
+        /* ── FIFO has data ── */
+        if (pfds[0].revents & POLLIN) {
             ssize_t n;
             while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
-                buf[n] = '\0';  /* Null-terminate for string handling */
-
+                buf[n] = '\0'; /* Null-terminate for string handling */
                 /* Strip trailing newline if present */
                 if (n > 0 && buf[n - 1] == '\n') {
                     buf[n - 1] = '\0';
@@ -516,30 +534,11 @@ static void *reader_thread(void *arg) {
         }
 
         /*
-         * POLLHUP: writer disconnected.
-         *
-         * CRITICAL EDGE CASE (from Tuesday lesson!):
-         * POLLHUP can arrive WITH POLLIN.
-         * If there's still data in the pipe buffer, we must drain it first.
-         *
-         * The read loop above already drained available data.
-         * After POLLHUP, we reopen the FIFO to accept new writers.
-         *
-         * This is what makes logd a proper daemon — it survives
-         * writer disconnects and reconnects.
+         * POLLHUP handling removed: with O_RDWR, we hold a writer
+         * reference ourselves, so POLLHUP is never sent for
+         * external writer disconnections. This is acceptable for
+         * a daemon — we just keep reading whatever arrives.
          */
-        if (pfd.revents & POLLHUP) {
-            printf("[logd] Writer disconnected, reopening FIFO...\n");
-            close(fd);
-            fd = open(FIFO_PATH, O_RDONLY);
-            if (fd < 0) {
-                if (g_running) {
-                    perror("reopen FIFO");
-                }
-                break;
-            }
-            printf("[logd] FIFO reopened, waiting for writers...\n");
-        }
     }
 
     close(fd);
@@ -620,7 +619,14 @@ int main(int argc, char *argv[]) {
     /* Step 4: Set up signal handlers */
     setup_signals();
 
-    /* Step 5: Launch worker (consumer) threads */
+    /* Step 5: Create shutdown notification pipe */
+    if (pipe(g_shutdown_pipe) < 0) {
+        perror("pipe");
+        /* ... cleanup ... */
+        return 1;
+    }
+
+    /* Step 6: Launch worker (consumer) threads */
     pthread_t workers[NUM_WORKERS];
     for (int i = 0; i < NUM_WORKERS; i++) {
         worker_arg_t *warg = malloc(sizeof(worker_arg_t));
@@ -653,7 +659,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Step 6: Launch reader (producer) thread */
+    /* Step 7: Launch reader (producer) thread */
     pthread_t reader;
     {
         int ret = pthread_create(&reader, NULL, reader_thread, NULL);
@@ -671,7 +677,7 @@ int main(int argc, char *argv[]) {
 
     printf("[logd] All threads launched. Running. (Ctrl+C or SIGTERM to stop)\n");
 
-    /* Step 7: Main thread waits for shutdown signal.
+    /* Step 8: Main thread waits for shutdown signal.
      *
      * The main thread's job after launching threads is simple:
      * wait for g_running to become 0 (set by signal handler).
@@ -687,7 +693,7 @@ int main(int argc, char *argv[]) {
 
     printf("\n[logd] Shutdown initiated...\n");
 
-    /* Step 8: Graceful shutdown sequence
+    /* Step 9: Graceful shutdown sequence
      *
      * Order matters:
      *   1. Stop the reader (no new messages)
@@ -699,10 +705,16 @@ int main(int argc, char *argv[]) {
      *   7. Remove FIFO (optional — some daemons leave it)
      */
 
-    /* Request shutdown — this wakes all threads blocked on cond_wait */
+     /* Signal the reader thread IMMEDIATELY via the shutdown pipe.
+     *     This interrupts poll() without waiting for the timeout. */
+    if (g_shutdown_pipe[1] >= 0) {
+        write(g_shutdown_pipe[1], "x", 1);  /* Any byte wakes poll() */
+    }
+
+    /* Tell ring buffer to shut down (wakes workers + reader if in rb_push) */
     rb_request_shutdown(&g_ring);
 
-    /* Wait for reader to finish */
+    /* Wait for reader first (it might be pushing final messages) */
     pthread_join(reader, NULL);
     printf("[logd] Reader thread joined\n");
 
@@ -715,6 +727,8 @@ int main(int argc, char *argv[]) {
     /* Cleanup */
     rb_destroy(&g_ring);
     close(g_log_fd);
+    close(g_shutdown_pipe[0]);
+    close(g_shutdown_pipe[1]);
 
     printf("[logd] Clean shutdown complete.\n");
     return 0;

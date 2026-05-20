@@ -1,7 +1,7 @@
 /*
  * 15_logd_enhanced.c — Multithreaded Logger Daemon (week 1 integration)
  *
- * The real problem in the previous code: signal handlers are fundamentally incompatible with multithreaded programming,
+ * The real problem in the previous code (14_logd.c): signal handlers are fundamentally incompatible with multithreaded programming,
  *                                        because they're asynchronous, global, and unpredictable.
  *                                        The solution is to eliminate them entirely.
  * The Solution: pthread_sigmask() + sigwait()
@@ -80,10 +80,64 @@
  *    main: pthread_join(reader) returns ✓
  *    main: pthread_join(workers) returns ✓
  *    main: cleanup → exit(0)
+ * 
+ * 
+ * 
+ * 
+ * 
+ *
 
  * Build: gcc -Wall -Wextra -pthread -o ./bin/logd_enhanced 15_logd.c
  * Usage: ./bin/logd_enhanced [fifo_path] [log_path]
  *        ./bin/logd_enhanced                        # defaults: /tmp/logd.fifo /var/log/logd.log
+ *
+ * 
+ * While testing, a new issue appears while trying to shutdown, it stucks again in the read_thread:
+ *   "[signal] Shutdown initiated, returning from signal thread
+ *   [logd] Worker 0 exiting
+ *   [logd] Signal thread joined
+ *   [logd] Worker 1 exiting
+ *   [logd] Worker 2 exiting"
+ * 
+ * But the stuck now has different root cause:
+ *      Timeline:
+        ═══════════
+
+        T1  We echo "hello" > /tmp/logd.fifo
+        T2  poll() returns with POLLIN on FIFO (pfds[0])
+        T3  Reader enters the INNER read() loop:
+
+            while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
+                // Read "hello" → n = 5 → process it
+                // Loop back → read() again
+                // read(fd, ...) ████ BLOCKS — waiting for MORE data
+                //    (O_RDWR means no EOF, so read() blocks forever)
+                //    The reader is STUCK HERE.
+            }
+
+        T4  We press Ctrl+C
+        T5  Signal thread writes to shutdown pipe → "x"
+        T6  But the reader is NOT in poll()!
+            It's stuck in read(fd, ...) inside the inner loop.
+            poll() never sees the shutdown pipe.
+            ██████ HANG FOREVER ██████
+
+ *       The shutdown pipe trick only works if the reader is inside poll().
+ *       If the reader is inside read(fd, buf, ...) on the FIFO, the shutdown pipe write doesn't help — read() is blocking on a completely different file descriptor.
+ *
+ * 
+ *  The solution is simple — set the FIFO fd to non-blocking mode after opening, and now the flow becomes:
+ *      T1  You echo "hello" > /tmp/logd.fifo
+ *      T2  poll() returns with POLLIN on FIFO
+ *      T3  Reader enters inner read() loop:
+ *          read() → "hello" (5 bytes) → process
+ *          read() → -1, errno = EAGAIN → inner loop exits
+ *      T4  Back to poll() — monitoring BOTH FIFO AND shutdown pipe ✓
+ *      
+ *      T5  You press Ctrl+C
+ *      T6  Signal thread writes to shutdown pipe
+ *      T7  poll() wakes up (shutdown pipe readable) → break → exit ✓
+ *         
  */
 
 #define _GNU_SOURCE
@@ -607,7 +661,36 @@ static void *reader_thread(void *arg) {
         return NULL;
     }
 
-    printf("[logd] FIFO opened, reading messages...\n");
+    /* Make FIFO non-blocking.
+     *
+     * Why: The inner read() loop drains all available data. When the
+     * pipe buffer is empty, read() with O_NONBLOCK returns -1/EAGAIN
+     * instead of blocking. This lets us return to poll(), which
+     * also monitors the shutdown pipe.
+     *
+     * Without this, read() blocks indefinitely inside the loop
+     * when no data is available (because O_RDWR means no EOF),
+     * and we never check the shutdown pipe.
+     */
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) {
+        perror("fcntl F_GETFL");
+        close(fd);
+        if (g_shutdown_pipe[1] >= 0)
+            write(g_shutdown_pipe[1], "x", 1);
+        rb_request_shutdown(&g_ring);
+        return NULL;
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        perror("fcntl F_SETFL O_NONBLOCK");
+        close(fd);
+        if (g_shutdown_pipe[1] >= 0)
+            write(g_shutdown_pipe[1], "x", 1);
+        rb_request_shutdown(&g_ring);
+        return NULL;
+    }
+
+    printf("[logd] FIFO opened (non-blocking), reading messages...\n");
 
     while (1) {  /* No g_running flag — exit only via shutdown pipe */
         memset(pfds, 0, sizeof(pfds));
@@ -653,7 +736,7 @@ static void *reader_thread(void *arg) {
             break;
         }
 
-        /* FIFO has data */
+        /* FIFO has data — drain it with non-blocking reads */
         if (pfds[0].revents & POLLIN) {
             ssize_t n;
             while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
@@ -670,11 +753,21 @@ static void *reader_thread(void *arg) {
 
                 if (rb_push(&g_ring, msg_copy) != 0) {
                     free(msg_copy);
-                    break;
+                    break; /* Ring buffer shutdown — exit inner loop */
                 }
             }
+            /* Inner loop exits here because:
+             *   - n <= 0 (no more data)
+             *   - n == -1, errno == EAGAIN (normal — pipe buffer empty)
+             *   - n == -1, other errno (error)
+             *   - rb_push returned -1 (shutdown)
+             *
+             * In ALL cases, we fall through to the top of the while(1)
+             * loop and go back to poll() — which checks the shutdown pipe.
+             */
             if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 perror("read FIFO");
+                break;  /* Actual error — exit outer loop */
             }
         }
     }

@@ -9,6 +9,8 @@
 #include <linux/init.h>       /* __init, __exit macros           */
 #include <linux/module.h>     /* MODULE_LICENSE, MODULE_AUTHOR   */
 #include <linux/kernel.h>     /* pr_info(), pr_err()             */
+#include <generated/utsrelease.h> /* UTS_RELEASE, needed for modern kernel versions (>2.4)*/
+
 
 /*
  * hello_init - Module initialization function

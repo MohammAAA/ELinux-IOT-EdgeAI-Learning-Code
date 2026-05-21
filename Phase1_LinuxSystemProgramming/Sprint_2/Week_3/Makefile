@@ -9,7 +9,7 @@
 # The -m suffix means "module" — kbuild recognizes this and
 # handles the .ko linking, modpost, and versioning automatically.
 
-obj-m += hello_module.o
+obj-m += 01_Minimal_kernel_module.o
 
 # KDIR — Path to the kernel build tree
 #
@@ -54,7 +54,7 @@ all:
 # 	    -C $(KDIR): This changes the directory (-C) to the kernel build path (e.g., /lib/modules/6.1.0-rpi5-rpi-v8/build).
 #           It tells make to use the main Linux kernel's massive Makefile instead of our own.
 #	    M=$(PWD): This tells the kernel's Makefile where our module source code is located.
-#           The kernel will jump into our directory to find our hello_module.c file.
+#           The kernel will jump into our directory to find our 01_Minimal_kernel_module.c file.
 #	    modules: This is the target rule inside the kernel's Makefile.
 #            It instructs the kernel build system to compile the files listed in obj-m into a loadable kernel module file ending in .ko.
 
@@ -65,10 +65,10 @@ clean:
 
 # Convenience targets for development:
 load:
-	sudo insmod hello_module.ko
+	sudo insmod 01_Minimal_kernel_module.ko
 
 unload:
-	sudo rmmod hello_module
+	sudo rmmod 01_Minimal_kernel_module
 
 log:
 	dmesg | tail -20

@@ -1,4 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
+/* The "// SPDX-License-Identifier: <identifier>" is not a comment for humans
+*  it's a machine-readable license tag that the kernel's build system and compliance tools parse.
+*  Key points:
+*     - Required by the kernel community: Since Linux 4.17, the kernel source (python script) checker (scripts/spdxcheck.py) will warn if this is missing.
+*     - Must match MODULE_LICENSE: If SPDX-License-Identifier says GPL-2.0 but MODULE_LICENSE("MIT"), we have a contradiction.
+*     - Format: Exactly SPDX-License-Identifier: <identifier>. The valid identifiers are listed at spdx.org/licenses.
+*  For our learning modules: Use GPL-2.0 since our MODULE_LICENSE is "GPL".
+*/
+
+
 /*
  * 1_Minimal_kernel_module.c - First kernel module for learning
  *

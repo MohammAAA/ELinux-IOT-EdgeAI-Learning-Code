@@ -341,7 +341,7 @@ static ssize_t hello_write(struct file *filp, const char __user *buf,
      * If we wanted to restrict to positive values:
      *   if (value < 0) return -EINVAL;
      */
-    
+
     /*
      * For a monotonic counter, resetting to 0 is the normal case.
      * But allowing arbitrary values makes testing easier.
@@ -502,6 +502,11 @@ fail_alloc:
  */
 static void __exit hello_cdev_exit(void)
 {
+    int final_reads, final_counter;
+
+    /* Snapshot stats BEFORE freeing anything */
+    final_reads = atomic_read(&hello_dev->read_count);
+    final_counter = atomic_read(&hello_dev->counter);
     /*
      * Cleanup in REVERSE order of initialization.
      *
@@ -521,12 +526,8 @@ static void __exit hello_cdev_exit(void)
     kfree(hello_dev);
     hello_dev = NULL;
 
-    pr_info("hello_cdev: unregistered — final stats: %d reads, counter=%d\n",
-            /* We can't read counters here because hello_dev is freed.
-             * This is why you should log stats BEFORE freeing.
-             * In a production driver, snapshot the stats first.
-             * For now, we rely on the last read's pr_debug message. */
-            0, 0);
+    pr_info("hello_cdev: unregistered %d total reads, final counter=%d\n",
+            final_reads, final_counter);
 }
 
 module_init(hello_cdev_init);

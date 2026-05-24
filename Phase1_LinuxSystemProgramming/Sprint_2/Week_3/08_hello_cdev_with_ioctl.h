@@ -12,12 +12,27 @@
  * NOTE: Only include this header for the ioctl definitions.
  * Kernel-specific headers (linux/module.h, linux/cdev.h) should
  * NOT be in this shared file.
+ * 
+ * Since this header file is shared between userspace and kernel space,
+ * this file must only contain compile-time constructs that produce identical results regardless of which compiler processes them.
+ * The header must not contain:
+ *  - pointers (rule; No pointers in structs in the shared header files)
+ *  - addresses
+ *  - No kernel-only types (spinlock_t, struct cdev, etc.)
+ *  - No #include <linux/module.h> or other kernel-internal headers
+ *  - No __user annotations (as this is a kernel-only macro)
+ * 
+ * 
+ * Another rule: Use __u8, __u16, __u32, __u64 for portability (they provide guaranteed sizes across all architectures)
+ * 
+ * This way, the header can be compiled independently by two different compilers.
  */
 
 #ifndef HELLO_CDEV_H
 #define HELLO_CDEV_H
 
 #include <linux/ioctl.h>  /* Available in both kernel and userspace via uapi */
+#include <linux/types.h>  /* UAPI — provides __u32, __u64, etc. */
 
 /* ──────────────────────────────────────────────
  * ioctl definitions
@@ -58,10 +73,10 @@
 
 /* Statistics struct — returned by HELLO_GET_STATS */
 struct hello_stats {
-    int counter;       /* Current counter value */
-    int total_reads;   /* Total number of read() calls */
-    int total_writes;  /* Total number of write() calls */
-    int total_ioctls;  /* Total number of ioctl() calls */
+    __u32 counter;       /* Current counter value */
+    __u32 total_reads;   /* Total number of read() calls */
+    __u32 total_writes;  /* Total number of write() calls */
+    __u32 total_ioctls;  /* Total number of ioctl() calls */
 };
 
 #endif /* HELLO_CDEV_H */

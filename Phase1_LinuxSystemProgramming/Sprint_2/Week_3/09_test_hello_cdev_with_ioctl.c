@@ -94,7 +94,7 @@ static void test_ioctl_set_count(void)
 
     INFO("HELLO_SET_COUNT — set counter to 42\n");
 
-    ret = ioctl(fd, HELLO_SET_COUNT, value);
+    ret = ioctl(fd, HELLO_SET_COUNT, &value);
     if (ret < 0) {
         FAIL("ioctl(SET_COUNT) failed: %s\n", strerror(errno));
         errors++;
@@ -126,7 +126,7 @@ static void test_ioctl_reset_count(void)
 
     INFO("HELLO_RESET_COUNT — reset counter to 0\n");
 
-    ret = ioctl(fd, HELLO_SET_COUNT, value);
+    ret = ioctl(fd, HELLO_SET_COUNT, &value);
     if (ret < 0) {
         FAIL("pre-set failed: %s\n", strerror(errno));
         errors++;
@@ -219,7 +219,7 @@ static void test_ioctl_set_negative(void)
 
     INFO("SET_COUNT with negative value (should fail with EINVAL)\n");
 
-    ret = ioctl(fd, HELLO_SET_COUNT, value);
+    ret = ioctl(fd, HELLO_SET_COUNT, &value);
     if (ret < 0 && errno == EINVAL) {
         PASS("Negative value correctly rejected with EINVAL\n");
     } else if (ret == 0) {

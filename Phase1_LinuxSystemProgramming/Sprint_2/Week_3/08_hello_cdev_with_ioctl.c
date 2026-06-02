@@ -543,7 +543,13 @@ static void __exit hello_cdev_exit(void)
  *
  * @filp: Open file (filp->private_data = our device struct)
  * @cmd:  The encoded ioctl command
- * @arg:  The argument (pointer for _IOR/_IOW, ignored for _IO)
+ * @arg:  The argument (pointer for _IOR/_IOW, ignored for _IO).
+*   Q: why the (arg) is of type (unsigned long), not of type (void *) since it is actually an address,
+ *     and the ioctl() syscall also gets it as an address? 
+ *  A: At the hardware level, a system call passes arguments in registers, not as pointers.
+ *     The kernel's syscall entry stub reads a raw register value — there is no "pointer" at this point. It's just an integer that happens to be an address.
+ *     The kernel receives this raw integer as (unsigned long) and then passes it to our driver. It only becomes a "pointer" when our driver explicitly casts it when it uses it.
+ *     So (unsigned long) is the honest type; it accurately describes what the CPU register contains. Calling it (void *) would be lying about the nature of the data at the syscall boundary.
  *
  * Validation strategy:
  *   Level 1: Check magic number (_IOC_TYPE)
@@ -555,18 +561,21 @@ static void __exit hello_cdev_exit(void)
 static long hello_ioctl(struct file *filp, unsigned int cmd,
                         unsigned long arg)
 {
+    pr_info("hello_cdev: Entered hello_ioctl()");
     struct hello_device *dev = filp->private_data;
 
     atomic_inc(&dev->ioctl_count);
 
     /* ── Level 1: Magic number checking ── */
-    if (_IOC_TYPE(cmd) != HELLO_IOC_MAGIC)
+    if (_IOC_TYPE(cmd) != HELLO_IOC_MAGIC){
+        pr_warn("hello_cdev: Magic number checking failed");
         return -ENOTTY; /* Not typewriter; this is the standard errno for iotctl check failure with reason: unknown command.*/
-
+    }
     /* ── Level 2: Command number range ── */
-    if (_IOC_NR(cmd) > HELLO_IOC_MAXNR)
+    if (_IOC_NR(cmd) > HELLO_IOC_MAXNR){
+        pr_warn("hello_cdev: cmd number checking failed");
         return -ENOTTY;
-
+    }
     /* ── Level 3: Per-command validation + handling ── */
     switch (cmd) {
     case HELLO_GET_COUNT:

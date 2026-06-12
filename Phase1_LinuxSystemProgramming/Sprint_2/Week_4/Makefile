@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -Werror -std=c11 -O2
-LDFLAGS = -li2c
+LDFLAGS = -li2c -lm
 TARGET  = mpu6050_diag
 SRC     = 02_mpu6050_diagnostics.c
 
